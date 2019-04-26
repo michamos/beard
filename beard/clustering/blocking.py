@@ -40,77 +40,6 @@ class _SingleClustering(BaseEstimator, ClusterMixin):
         return block_single(X)
 
 
-def _parallel_fit(fit_, partial_fit_, estimator, verbose, data_queue,
-                  result_queue):
-    """Run clusterer's fit function."""
-    # Status can be one of: 'middle', 'end'
-    # 'middle' means that there is a block to compute and the process should
-    # continue
-    # 'end' means that the process should finish as all the data was sent
-    # by the main process
-    status, block, existing_clusterer = data_queue.get()
-
-    while status != 'end':
-
-        b, X, y = block
-
-        if len(X) == 1:
-            clusterer = _SingleClustering()
-        elif existing_clusterer and partial_fit_ and not fit_:
-            clusterer = existing_clusterer
-        else:
-            clusterer = clone(estimator)
-
-        if verbose > 1:
-            print("Clustering %d samples on block '%s'..." % (len(X), b))
-
-        if fit_ or not hasattr(clusterer, "partial_fit"):
-            try:
-                clusterer.fit(X, y=y)
-            except TypeError:
-                clusterer.fit(X)
-        elif partial_fit_:
-            try:
-                clusterer.partial_fit(X, y=y)
-            except TypeError:
-                clusterer.partial_fit(X)
-
-        result_queue.put((b, clusterer))
-        status, block, existing_clusterer = data_queue.get()
-
-    data_queue.put(('end', None, None))
-    return
-
-
-def _single_fit(fit_, partial_fit_, estimator, verbose, data):
-    """Run clusterer's fit function."""
-    block, existing_clusterer = data
-    b, X, y = block
-
-    if len(X) == 1:
-        clusterer = _SingleClustering()
-    elif existing_clusterer and partial_fit_ and not fit_:
-        clusterer = existing_clusterer
-    else:
-        clusterer = clone(estimator)
-
-    if verbose > 1:
-        print("Clustering %d samples on block '%s'..." % (len(X), b))
-
-    if fit_ or not hasattr(clusterer, "partial_fit"):
-        try:
-            clusterer.fit(X, y=y)
-        except TypeError:
-            clusterer.fit(X)
-    elif partial_fit_:
-        try:
-            clusterer.partial_fit(X, y=y)
-        except TypeError:
-            clusterer.partial_fit(X)
-
-    return (b, clusterer)
-
-
 class BlockClustering(BaseEstimator, ClusterMixin):
     """Implements blocking for clustering estimators.
 
@@ -210,88 +139,59 @@ class BlockClustering(BaseEstimator, ClusterMixin):
 
             yield (b, X_mask, y_mask)
 
+    def _single_fit(self, indexed_block):
+        """Run clusterer's fit function."""
+        index, block = indexed_block
+
+        if self.partial_fit_ and block[0] in self.clusterers_:
+            existing_clusterer = self.clusterers_[block[0]]
+        else:
+            existing_clusterer = None
+
+        b, X, y = block
+
+        if len(X) == 1:
+            clusterer = _SingleClustering()
+        elif existing_clusterer and self.partial_fit_ and not self.fit_:
+            clusterer = existing_clusterer
+        else:
+            clusterer = clone(self.base_estimator)
+
+        if self.verbose > 1:
+            print("Clustering %d samples on block '%s'..." % (len(X), b))
+
+        if self.fit_ or not hasattr(clusterer, "partial_fit"):
+            try:
+                clusterer.fit(X, y=y)
+            except TypeError:
+                clusterer.fit(X)
+        elif self.partial_fit_:
+            try:
+                clusterer.partial_fit(X, y=y)
+            except TypeError:
+                clusterer.partial_fit(X)
+
+        print("Trained clustering on {}-th block: {}".format(index, b))
+
+        return (b, clusterer)
+
     def _fit(self, X, y, blocks):
         """Fit base clustering estimators on X."""
         self.blocks_ = blocks
 
+        blocks_all = len(np.unique(blocks))
+        print("Going to train {} blocks in total".format(blocks_all))
+
+        enumerated_blocks = enumerate(self._blocks(X, y, blocks), 1)
+
         if self.n_jobs == 1:
-            blocks_computed = 0
-            blocks_all = len(np.unique(blocks))
-
-            for block in self._blocks(X, y, blocks):
-                if self.partial_fit_ and block[0] in self.clusterers_:
-                    data = (block, self.clusterers_[block[0]])
-                else:
-                    data = (block, None)
-
-                b, clusterer = _single_fit(self.fit_, self.partial_fit_,
-                                           self.base_estimator, self.verbose,
-                                           data)
-
-                if clusterer:
-                    self.clusterers_[b] = clusterer
-
-                if blocks_computed < blocks_all:
-                    print("%s blocks computed out of %s" % (blocks_computed,
-                                                            blocks_all))
-                blocks_computed += 1
+            results = map(self._single_fit, enumerated_blocks)
         else:
-            try:
-                from multiprocessing import SimpleQueue
-            except ImportError:
-                from multiprocessing.queues import SimpleQueue
+            from multiprocessing import Pool
+            pool = Pool(self.n_jobs)
+            results = pool.imap_unordered(self._single_fit, enumerated_blocks)
 
-            # Here the blocks will be passed to subprocesses
-            data_queue = SimpleQueue()
-            # Here the results will be passed back
-            result_queue = SimpleQueue()
-
-            for x in range(self.n_jobs):
-                import multiprocessing as mp
-                processes = []
-
-                processes.append(mp.Process(target=_parallel_fit, args=(
-                                 self.fit_, self.partial_fit_,
-                                 self.base_estimator, self.verbose,
-                                 data_queue, result_queue)))
-                processes[-1].start()
-
-            # First n_jobs blocks are sent into the queue without waiting
-            # for the results. This variable is a counter that takes care of
-            # this.
-            presend = 0
-            blocks_computed = 0
-            blocks_all = len(np.unique(blocks))
-
-            for block in self._blocks(X, y, blocks):
-                if presend >= self.n_jobs:
-                    b, clusterer = result_queue.get()
-                    blocks_computed += 1
-                    if clusterer:
-                        self.clusterers_[b] = clusterer
-                else:
-                    presend += 1
-                if self.partial_fit_:
-                    if block[0] in self.clusterers_:
-                        data_queue.put(('middle', block, self.clusterers_[b]))
-                        continue
-
-                data_queue.put(('middle', block, None))
-
-            # Get the last results and tell the subprocesses to finish
-            for x in range(self.n_jobs):
-                if blocks_computed < blocks_all:
-                    print("%s blocks computed out of %s" % (blocks_computed,
-                                                            blocks_all))
-                    b, clusterer = result_queue.get()
-                    blocks_computed += 1
-                    if clusterer:
-                        self.clusterers_[b] = clusterer
-
-            data_queue.put(('end', None, None))
-
-            time.sleep(1)
-
+        self.clusterers_ = dict(results)
         return self
 
     def fit(self, X, y=None, blocks=None):
