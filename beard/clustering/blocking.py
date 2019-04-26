@@ -188,7 +188,7 @@ class BlockClustering(BaseEstimator, ClusterMixin):
             results = map(self._single_fit, enumerated_blocks)
         else:
             from multiprocessing import Pool
-            pool = Pool(self.n_jobs)
+            pool = Pool(self.n_jobs, maxtasksperchild=10) # TODO make this configurable
             results = pool.imap_unordered(self._single_fit, enumerated_blocks)
 
         self.clusterers_ = dict(results)
